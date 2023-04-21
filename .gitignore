@@ -1,2 +1,11 @@
 target/
 Cargo.lock
+
+*.synctex.gz
+*.out
+*.log
+*.fls
+*.bbl
+*.blg
+*.aux
+*.fdb_latexmk
