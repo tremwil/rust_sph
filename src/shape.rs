@@ -8,36 +8,63 @@ pub struct Collision {
     pub penetration: f32,
 }
 
-pub trait Shape {
+#[dyn_clonable::clonable]
+pub trait Shape : Clone {
+    /// Get a rectangular bounding box for this shape.
     fn aabb(&self) -> (Vec2, Vec2);
+
+    /// Resolve collisions between this shape and a circle of position p and radius r.
     fn check_circle_collisions(&self, p: Vec2, r: f32) -> Option<Collision>;
-    fn boundary_intersects_aabb(&self, aa: Vec2, bb: Vec2) -> bool;
+    
+    /// Check if this shape (or its boundary, if infinite) intersects a rectangular bounding box.
+    fn intersects_aabb(&self, aa: Vec2, bb: Vec2) -> bool;
+    
+    /// Draw this shape with the given thickness, outline and fill color. Optionally draw surface normals as well.
     fn draw(&self, thickness: f32, outline: Option<Color>, fill: Option<Color>, normals: Option<Color>);
+    
+    /// Query a random point inside this shape. 
     fn random_point(&self) -> Vec2;
+
+    fn into_shape_box(self) -> Box<dyn Shape> where Self: Sized + 'static {
+        Box::new(self)
+    }
+}
+/// Trait to make it easy to forward the Shape implementation of an object owning a Shape, without dynamic dispatch.]
+pub trait ShapeOwner {
+    type ShapeType : Shape + ?Sized;
+    fn shape(&self) -> &Self::ShapeType;
 }
 
-// Allow Box<dyn Shape> objects to impl Shape funcs
-impl<S : Shape + ?Sized> Shape for Box<S> {
+impl<SO: ShapeOwner + Clone> Shape for SO {
     fn aabb(&self) -> (Vec2, Vec2) {
-        self.as_ref().aabb()
+        self.shape().aabb()
     }
 
-    fn boundary_intersects_aabb(&self, aa: Vec2, bb: Vec2) -> bool {
-        self.as_ref().boundary_intersects_aabb(aa, bb)
+    fn intersects_aabb(&self, aa: Vec2, bb: Vec2) -> bool {
+        self.shape().intersects_aabb(aa, bb)
     }
 
     fn check_circle_collisions(&self, p: Vec2, r: f32) -> Option<Collision> {
-        self.as_ref().check_circle_collisions(p, r)
+        self.shape().check_circle_collisions(p, r)
     }
 
     fn draw(&self, thickness: f32, outline: Option<Color>, fill: Option<Color>, normals: Option<Color>) {
-        self.as_ref().draw(thickness, outline, fill, normals)
+        self.shape().draw(thickness, outline, fill, normals)
     }
 
     fn random_point(&self) -> Vec2 {
-        self.as_ref().random_point()
+        self.shape().random_point()
     }
-} 
+}
+
+// Allow Box<dyn Shape> objects to impl Shape funcs
+impl<S : Shape + ?Sized> ShapeOwner for Box<S> {
+    type ShapeType = S;
+    fn shape(&self) -> &Self::ShapeType {
+        self.as_ref()
+    }
+}
+
 
 /// Half-plane boundary object. Assumes elements will not go over start or end for culling purposes,
 /// so make the segment large enough!  
@@ -62,9 +89,10 @@ impl Shape for HalfPlane {
         })
     }
 
-    fn boundary_intersects_aabb(&self, aa: Vec2, bb: Vec2) -> bool {
+    fn intersects_aabb(&self, aa: Vec2, bb: Vec2) -> bool {
         let corners = &[aa, bb, vec2(aa.x, bb.y), vec2(bb.x, aa.y)];
-        !corners.iter().map(|&c| (c - self.start).dot(self.normal).signum()).all_equal()
+        let it = corners.iter().map(|&c| (c - self.start).dot(self.normal));
+        it.clone().any(|s| s.abs() < 1e-6) || !it.map(|s| s.signum()).all_equal()
     }
 
     fn draw(&self, thickness: f32, outline: Option<Color>, _: Option<Color>, normals: Option<Color>) {
@@ -80,6 +108,106 @@ impl Shape for HalfPlane {
 
     fn random_point(&self) -> Vec2 {
         self.start + gen_range::<f32>(0., 1.) * (self.end - self.start)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AABB {
+    pub aa: Vec2,
+    pub bb: Vec2
+}
+
+impl AABB {
+    pub const NORMALS : [Vec2; 4] = [
+        vec2(0., -1.),
+        vec2(1., 0.),
+        vec2(0., 1.),
+        vec2(-1., 0.)
+    ];
+
+    pub fn center(&self) -> Vec2 {
+        (self.aa + self.bb) / 2.
+    }
+
+    pub fn size(&self) -> Vec2 {
+        self.bb - self.aa
+    }
+
+    pub fn corners(&self) -> [Vec2; 4] {
+        [self.aa, vec2(self.bb.x, self.aa.y), self.bb, vec2(self.aa.x, self.bb.y)]
+    }
+
+    pub fn corners_looping(&self) -> [Vec2; 5] {
+        [self.aa, vec2(self.bb.x, self.aa.y), self.bb, vec2(self.aa.x, self.bb.y), self.aa]
+    }
+
+    pub fn sides(&self) -> impl Iterator<Item = ((Vec2, Vec2), Vec2)> {
+        self.corners_looping().into_iter().tuple_windows().zip(Self::NORMALS)
+    }
+}
+
+impl Shape for AABB {
+    fn aabb(&self) -> (Vec2, Vec2) {
+        (self.aa, self.bb)
+    }
+    
+    fn intersects_aabb(&self, aa: Vec2, bb: Vec2) -> bool {
+        (self.bb.min(bb) - self.aa.max(aa)).cmpge(Vec2::ZERO).all()
+    }
+
+    fn check_circle_collisions(&self, p: Vec2, r: f32) -> Option<Collision> {
+        let closest_point = p.clamp(self.aa, self.bb);
+        let distance_squared = (p - closest_point).length_squared();
+        (distance_squared <= r * r).then_some({
+            let normal : Vec2;
+            let penetration : f32;
+
+            // Center of circle is inside AABB, check every axis
+            if p.cmpge(self.aa).all() && p.cmple(self.bb).all() {
+                (penetration, normal) = [
+                    p.y - self.aa.y + r,
+                    self.bb.x - p.x + r,
+                    self.bb.y - p.y + r,
+                    p.x - self.aa.x + r 
+                ].into_iter()
+                    .zip(Self::NORMALS)
+                    .min_by(|a, b| a.0.total_cmp(&b.0))
+                    .unwrap();
+            }
+            else {
+                let dist = distance_squared.sqrt();
+                normal = (p - closest_point) / dist;
+                penetration = r - dist;
+            }
+            Collision {
+                normal,
+                penetration
+            }
+        })
+    }
+
+    fn draw(&self, thickness: f32, outline: Option<Color>, fill: Option<Color>, normals: Option<Color>) {
+        let sz = self.size();
+        if let Some(c) = fill {
+            draw_rectangle(self.aa.x, self.aa.y, sz.x, sz.y, c);
+        }
+        if let Some(c) = outline {
+            draw_rectangle_lines(self.aa.x, self.aa.y, sz.x, sz.y, thickness, c)
+        }
+        if let Some(c) = normals {
+            for ((s, e), n) in self.sides() {
+                let middle = (s + e) / 2.;
+                let normal_point = middle + n * 20. * thickness;
+                draw_line(middle.x, middle.y, normal_point.x, normal_point.y, thickness, c);
+            }
+        }
+    }
+
+    fn random_point(&self) -> Vec2 {
+        vec2(
+            gen_range(self.aa.x, self.bb.x),
+            gen_range(self.aa.y, self.bb.y)
+        )
     }
 }
 
@@ -112,14 +240,10 @@ impl Shape for Circle {
         }
     }
 
-    fn boundary_intersects_aabb(&self, aa: Vec2, bb: Vec2) -> bool {
-        let circumcircle_radius = 0.5 * (bb - aa).max_element();
-        let distance_to_center_squared = (self.center - 0.5 * (aa + bb)).length_squared();
-        
+    fn intersects_aabb(&self, aa: Vec2, bb: Vec2) -> bool {
         let closest_point = self.center.clamp(aa, bb);
         let distance_squared = (closest_point - self.center).length_squared();
-
-        distance_squared < self.radius.powi(2) && distance_to_center_squared >= (self.radius - circumcircle_radius).max(0.).powi(2)
+        distance_squared < self.radius.powi(2)
     }
 
     fn draw(&self, thickness: f32, outline: Option<Color>, fill: Option<Color>, _: Option<Color>) {
@@ -150,7 +274,7 @@ impl ConvexPolygon {
         let vertices = vertices.into_iter().collect_vec();
         let mut normals : Vec<Vec2> = Vec::with_capacity(vertices.len());
         for i in 0..vertices.len() {
-            let n = (vertices[(i+1) % vertices.len()] - vertices[i]).perp().normalize();
+            let n = -(vertices[(i+1) % vertices.len()] - vertices[i]).perp().normalize();
             normals.push(n);
         }
         ConvexPolygon {
@@ -186,12 +310,18 @@ impl Shape for ConvexPolygon {
         Some(least_separation)
     }
 
-    fn boundary_intersects_aabb(&self, aa: Vec2, bb: Vec2) -> bool {
-        let corners = &[aa, bb, vec2(aa.x, bb.y), vec2(bb.x, aa.y)];
-        self.vertices
+    fn intersects_aabb(&self, aa: Vec2, bb: Vec2) -> bool {
+        let aabb = AABB { aa, bb };
+        let aabb_verts = aabb.corners();
+        // SAT with polygon
+        let sat_poly = self.vertices
             .iter()
             .zip(self.normals.iter())
-            .any(|(&v, &n)| !corners.iter().map(|&c| (c - v).dot(n).signum()).all_equal())
+            .all(|(&v, &n)| aabb_verts.iter().any(|&u| (u - v).dot(n) < 0.));
+        // SAT with AABB
+        sat_poly && aabb
+            .sides()
+            .all(|((s, e), n)| self.vertices.iter().any(|&v| (v - s).dot(n) < 0.))
     }
 
     fn draw(&self, thickness: f32, outline: Option<Color>, fill: Option<Color>, normals: Option<Color>) {
@@ -207,8 +337,8 @@ impl Shape for ConvexPolygon {
             vertices.push(Vertex::new(center_point.x, center_point.y, 0., 0., 0., color));
 
             for i in 0..sides+1 {
-                let v = self.vertices[i];
-                let n = self.normals[i];
+                let v = self.vertices[i % self.vertices.len()];
+                let n = self.normals[i % self.vertices.len()];
                 let vertex = Vertex::new(v.x, v.y, 0., n.x, n.y, color);
                 vertices.push(vertex);
         

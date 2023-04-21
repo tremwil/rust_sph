@@ -8,6 +8,8 @@ macroquad = "0.3.25"
 hashbrown = { version = "0.13.2", features = [ "rayon", "inline-more" ] }
 itertools = "0.10.5"
 rayon = "1.7.0"
+dyn-clonable = "0.9.0"
+spin_sleep = "1.1.1"
 
 #[profile.release] 
 #debug = true

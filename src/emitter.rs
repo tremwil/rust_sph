@@ -2,6 +2,7 @@
 use macroquad::prelude::*;
 use crate::{fluid_sim::*, fluid::*, shape::*};
 
+#[derive(Clone)]
 pub struct FluidEmitter {
     pub shape: Box<dyn Shape>,
     pub rate: f32,
@@ -24,6 +25,9 @@ impl FluidEmitter {
                 x: self.shape.random_point(),
                 v: self.spawn_velocity,
                 f: Vec2::ZERO, 
+                ci_grad: Vec2::ZERO,
+                cp_grad: Vec2::ZERO,
+                cs_grad: Vec2::ZERO,
                 alpha: consts.alpha, 
                 rho0: consts.alpha / self.spawn_temp,
                 rho: consts.alpha / self.spawn_temp, 
@@ -31,8 +35,8 @@ impl FluidEmitter {
                 k: consts.k, 
                 ci: consts.ci, 
                 cs: consts.cs, 
-                sigma_i: consts.sigma_i,
-                sigma_s: consts.sigma_s,
+                // sigma_i: consts.sigma_i,
+                // sigma_s: consts.sigma_s,
                 t: self.spawn_temp,
                 next_t: self.spawn_temp,
                 id: 0,

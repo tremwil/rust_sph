@@ -39,6 +39,8 @@ impl<T> RealVec for T where T:
 }
 
 pub trait SmoothingKernel {
+    const NAME: &'static str;
+
     const VALUE_NEEDS_SQRT: bool = true;
     const GRADIENT_NEEDS_SQRT: bool = true;
     const LAPLACIAN_NEEDS_SQRT: bool = true; 
@@ -129,24 +131,26 @@ impl WPoly6 {
     const C: f32 = 24. / consts::PI;
 }
 impl SmoothingKernel for WPoly6 {
+    const NAME: &'static str = "WPoly6(r, h) = 4/(pi h^8) * (h^2 - r^2)^3";
+
     const VALUE_NEEDS_SQRT: bool = false;
     const GRADIENT_NEEDS_SQRT: bool = false;
     const LAPLACIAN_NEEDS_SQRT: bool = false; 
 
     fn value_unchecked(r: Vec2, l: f32, h: f32) -> f32 {
-        let r2 = l * l;
+        let r2 = r.length_squared();
         let h2 = h * h;
         Self::A / h2.powi(4) * (h2 - r2).powi(3)
     }
 
     fn gradient_unchecked(r: Vec2, l: f32, h: f32) -> Vec2 {
-        let r2 = l * l;
+        let r2 = r.length_squared();
         let h2 = h * h;
         -Self::B / h2.powi(4) * (h2 - r2).powi(2) * r
     }
 
     fn laplacian_unchecked(r: Vec2, l: f32, h: f32) -> f32 {
-        let r2 = l * l;
+        let r2 = r.length_squared();
         let h2 = h * h;
         -Self::C / h2.powi(4) * (h2 - r2) * (3.*h2 - 7.*r2)
     }
@@ -161,6 +165,8 @@ impl WSpiky {
 }
 
 impl SmoothingKernel for WSpiky {
+    const NAME: &'static str = "WSpiky(r, h) = 10/(pi h^5) * (h-r)^3";
+
     fn value_unchecked(r: Vec2, l: f32, h: f32) -> f32 {
         Self::A / h.powi(5) * (h - l).powi(3)
     }
@@ -183,6 +189,8 @@ impl WViscosity {
 }
 
 impl SmoothingKernel for WViscosity {
+    const NAME: &'static str = "WViscosity(r, h) = 10/(3pi h^2) (-r3 / (2h^3) + r^2/h^2 + h/(2r) - 1)";
+
     fn value_unchecked(r: Vec2, l: f32, h: f32) -> f32 {
         let r2 = l * l;
         let h2 = h * h;
@@ -193,8 +201,8 @@ impl SmoothingKernel for WViscosity {
     fn gradient_unchecked(r: Vec2, l: f32, h: f32) -> Vec2 {
         let r2 = l * l;
         let h2 = h * h;
-        let term = -3./2. * l / (h2 * h) + 2. / h2 - h / (2. * r2 * l);
-        -Self::B / h2 * r * term
+        let term = -1.5 * l / (h2 * h) + 2. / h2 - h / (2. * r2 * l);
+        Self::B / h2 * r * term
     }
 
     fn laplacian_unchecked(r: Vec2, l: f32, h: f32) -> f32 {

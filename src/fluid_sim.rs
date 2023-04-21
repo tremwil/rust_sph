@@ -1,4 +1,4 @@
-use std::{sync::atomic::{AtomicU32, Ordering, compiler_fence}, marker::PhantomData};
+use std::{sync::{atomic::{AtomicU32, Ordering, compiler_fence}, Arc}, marker::PhantomData, cell};
 
 use hashbrown::{HashMap, HashSet};
 use itertools::Itertools;
@@ -7,63 +7,59 @@ use rayon::prelude::*;
 
 use crate::{fluid::{*, self}, shape::*};
 use crate::kernels::*;
+use crate::interacting_body::*;
 
-#[derive(Default)]
-struct GridCell
+/// Spatial hash grid cell.
+#[derive(Default, Clone)]
+pub struct GridCell
 {
     /// Set of particles which currently lie in this grid cell.
     pub particles: HashMap<ParticleId, FluidParticle>,
-    /// Set of boundary indices which intersect this grid cell. Used to accelerate collisions.
+    /// Boundaries: 
     pub boundaries: Vec<usize>,
-    // Set of particle sinks which intersect this grid cell. Used to accelerate collisions. 
-    pub sinks: Vec<usize>
+    /// Interacting elements, stored here to accelerate collisions
+    pub interacting_bodies: Vec<usize>, 
 }
 
 impl GridCell {
+    /// Check if the grid cell is empty, i.e. does not contain any particles or boundary/sink references. 
     pub fn is_empty(&self) -> bool {
-        return self.particles.is_empty() && self.boundaries.is_empty() && self.sinks.is_empty()
+        return self.particles.is_empty() && self.boundaries.is_empty() && self.interacting_bodies.is_empty()
     }
 }
 
-struct SpatialHash {
-    grid: HashMap<IVec2, GridCell>,
+#[derive(Clone)]
+/// Spatial hash data structure, meant to accelerate range queries. 
+pub struct SpatialHash {
+    cells: HashMap<IVec2, GridCell>,
     particle_cells: HashMap<ParticleId, IVec2>,
-    grid_step: f32,
-    inv_grid_step: f32,
+    step: f32,
+    inv_step: f32,
 }
 impl SpatialHash {
     pub fn new(grid_step: f32) -> Self {
         Self { 
-            grid: HashMap::new(),
+            cells: HashMap::new(),
             particle_cells: HashMap::new(),
-            grid_step,
-            inv_grid_step: 1. / grid_step
+            step: grid_step,
+            inv_step: 1. / grid_step
         }
     }
 
-    pub fn grid_step(&self) -> f32 {
-        self.grid_step
+    /// Necessary workaround to compute indicies when inside an iterator that already has a &mut self reference
+    pub fn index_no_borrow(position: Vec2, inv_step: f32) -> IVec2 {
+        (position * inv_step).floor().as_ivec2()
     }
 
-    pub fn inv_grid_step(&self) -> f32 {
-        self.inv_grid_step
+    /// Compute the index of the grid cell a particular position lies in. 
+    pub fn index(&self, position: Vec2) -> IVec2 {
+        (position * self.inv_step).floor().as_ivec2()
     }
 
-    pub fn grid_index(&self, position: Vec2) -> IVec2 {
-        (position * self.inv_grid_step).floor().as_ivec2()
-    }
-
-    pub fn get_cell(&self, i: IVec2) -> Option<&GridCell> {
-        self.grid.get(&i)
-    }
-
-    pub fn get_cell_mut(&mut self, i: IVec2) -> Option<&mut GridCell> {
-        self.grid.get_mut(&i)
-    }
-
-    pub fn particle_cells_par(&self) -> impl ParallelIterator<Item = (&FluidParticle, &GridCell)> {
+    /// Parallel iterator over particles and the grid cells containing them. 
+    pub fn particles_par(&self) -> impl ParallelIterator<Item = (&FluidParticle, &GridCell)> {
         self.particle_cells.par_iter().map(|(id, i)| {
-            let grid = &self.grid[i];
+            let grid = &self.cells[i];
             (&grid.particles[id], grid)
         })
     }
@@ -71,68 +67,122 @@ impl SpatialHash {
     pub fn get_boundary_cells<'a, S: Shape>(&self, shape: &'a S) -> impl Iterator<Item = IVec2> + 'a {
         let (min, max) = {
             let aabb = shape.aabb();
-            (self.grid_index(aabb.0 - self.grid_step), self.grid_index(aabb.1 + self.grid_step))
+            (self.index(aabb.0 - self.step), self.index(aabb.1 + self.step))
         };
 
-        let h = self.grid_step;
+        let h = self.step;
         (min.x ..= max.x).cartesian_product(min.y ..= max.y)
             .filter(move |&(x, y)| {
                 let v = ivec2(x, y).as_vec2() * h;
-                shape.boundary_intersects_aabb(v, v + h) 
+                shape.intersects_aabb(v, v + h) 
             })
             .flat_map(|(x, y)| (x-1 ..= x+1).cartesian_product(y-1 ..= y+1))
             .map(|(x,y)| ivec2(x,y))
             .unique()
     }
 
-    fn register_sink<S : Shape>(&mut self, id: usize, shape: &S) {
-        for i in self.get_boundary_cells(shape) {
-            self.grid.entry(i).or_default().sinks.push(id);
-        }
-    }
-
     fn register_boundary<S: Shape>(&mut self, id: usize, shape: &S) {
         for i in self.get_boundary_cells(shape) {
-            self.grid.entry(i).or_default().boundaries.push(id);
+            self.cells.entry(i).or_default().boundaries.push(id);
         }
     }
 
-    pub fn add_particle(&mut self, p: FluidParticle) {
-        let i = self.grid_index(p.x);
-        self.grid.entry(i).or_default().particles.insert(p.id, p);
-        self.particle_cells.insert(p.id, i);
+    fn register_interacting_body<S: Shape>(&mut self, id: usize, shape: &S) {
+        for i in self.get_boundary_cells(shape) {
+            self.cells.entry(i).or_default().interacting_bodies.push(id);
+        }
     }
 
+    /// ### SAFETY:
+    /// Particle with same ID is not currently present in the spatial hash grid. 
+    pub fn add_particle(&mut self, p: FluidParticle) {
+        let i = self.index(p.x);
+        let id = p.id;
+        self.cells.entry(i).or_default().particles.insert_unique_unchecked(id, p);
+        self.particle_cells.insert_unique_unchecked(id, i);
+    }
+
+    /// Remove particle from the spatial hash grid, returning it if it was present. 
     pub fn remove_particle(&mut self, id: ParticleId) -> Option<FluidParticle> {
         let i = self.particle_cells.remove(&id)?;
-        let cell = self.grid.get_mut(&i)?;
+        let cell = self.cells.get_mut(&i)?;
         cell.particles.remove(&id)
     }
 
+    /// Update particle properties, including position information, and return a bool specifying if
+    /// the particle should be destroyed or not. 
+    pub fn move_and_filter_particles(&mut self, mut f: impl FnMut(&mut FluidParticle, &Vec<usize>, &Vec<usize>) -> bool) {
+        self.particle_cells.drain_filter(|id, i| {
+            let c = self.cells.get_mut(i).unwrap();
+            let p = c.particles.get_mut(id).unwrap();
+
+            if f(p, &c.boundaries, &c.interacting_bodies) {
+                c.particles.remove(id);
+                return true;
+            }
+
+            let i_new = Self::index_no_borrow(p.x, self.inv_step);
+            if *i != i_new {
+                let p = c.particles.remove(id).unwrap();
+                self.cells.entry(i_new).or_default().particles.insert_unique_unchecked(*id, p);
+                *i = i_new;
+            }
+            false
+        });
+    }
+
     pub fn move_particle(&mut self, id : ParticleId, new_pos: Vec2) -> Result<(), ()> {
-        let i_new = self.grid_index(new_pos);
+        let i_new = self.index(new_pos);
         let i = self.particle_cells.get_mut(&id).ok_or(())?;
         if *i != i_new {
-            let old_cell = self.grid.get_mut(i).ok_or(())?;
+            let old_cell = self.cells.get_mut(i).ok_or(())?;
             let p = old_cell.particles.remove(&id).ok_or(())?;
-            self.grid.entry(i_new).or_default().particles.insert(id, p);
+            self.cells.entry(i_new).or_default().particles.insert_unique_unchecked(id, p);
             *i = i_new;
         }
         Ok(())
     }
 
     pub fn remove_empty_cells(&mut self) {
-        self.grid.drain_filter(|i, cell| cell.is_empty());
+        self.cells.drain_filter(|_, cell| cell.is_empty());
+    }
+
+    pub fn range_query(&self, pos: Vec2, r: f32) -> impl Iterator<Item = &FluidParticle> {
+        let low = self.index(pos - r);
+        let high = self.index(pos + r);
+        let r2 = r * r;
+
+        (low.x ..= high.x)
+            .cartesian_product(low.y ..= high.y)
+            .filter_map(move |i| self.cells.get(&ivec2(i.0, i.1)))
+            .flat_map(|c| c.particles.values())
+            .filter(move |p| (p.x - pos).length_squared() < r2)
+    }
+
+    pub fn particle(&self, id: ParticleId) -> Option<&FluidParticle> {
+        let pos = self.particle_cells.get(&id)?;
+        self.cells.get(pos)?.particles.get(&id)
+    }
+
+    pub fn particle_mut(&mut self, id: ParticleId) -> Option<&mut FluidParticle> {
+        let pos = self.particle_cells.get_mut(&id)?;
+        self.cells.get_mut(pos)?.particles.get_mut(&id)
     }
 }
 
 
 /// Trait holding the different smoothing kernels which will be used by the fluid simulation.
 pub trait SimKernels {
+    /// Kernel used to particle densities.
     type DensityKernel : SmoothingKernel;
+    /// Kernel used to compute pressure forces.
     type PressureKernel : SmoothingKernel;
+    /// Kernel used to compute viscosity forces.
     type ViscosityKernel : SmoothingKernel;
+    /// Kernel used to compute fluid-fluid interface forces 
+    /// (interface tension, surface tension and fluid-air boundary field).
     type InterfaceKernel : SmoothingKernel;
+    /// Kernel used to compute heat diffusion. 
     type HeatKernel: SmoothingKernel;
 }
 
@@ -142,42 +192,76 @@ impl SimKernels for DefaultSimKernels {
     type DensityKernel = WSpiky;
     type PressureKernel = WSpiky;
     type ViscosityKernel = WViscosity;
-    type InterfaceKernel = WViscosity;
+    type InterfaceKernel = WPoly6;
     type HeatKernel = WViscosity;
 }
 
+#[derive(Clone)]
+pub struct AirGenerationParams {
+    pub generation_threshold: f32,
+    pub spawn_position_offset: f32,
+
+    pub deletion_threshold_p: f32,
+    pub deletion_threshold_s: f32,
+    pub deletion_threshold_rho: f32,
+
+    pub air_buyoyancy: f32, // Artificial buoyancy for air particles
+    pub air_mass: f32, // Mass of spawned air particles
+    pub air_temp: f32, // Temperature of spawned air
+    pub air_id: FluidId // Fluid ID of air particles
+}
+
+#[derive(Clone)]
 pub struct FluidSim<K: SimKernels = DefaultSimKernels>
 {   
-    grid: HashMap<IVec2, GridCell>,
+    grid: SpatialHash,
     boundaries: Vec<Box<dyn Shape>>,
-    sinks: Vec<Box<dyn Shape>>,
+    interacting_bodies: Vec<Box<dyn InteractingStaticBody>>,
     fluid_types: Vec<FluidType>,
-    particle_positions: HashMap<ParticleId, IVec2>,
     h: f32,
-    inv_grid_step: f32,
-    particle_id_counter: AtomicU32,
+    particle_id_counter: u32,
+
     pub gravity: Vec2,
     pub heat_diffusion: f32,
+    pub air_gen_params: Option<AirGenerationParams>,
+    pub sim_limits: Option<AABB>,
 
     k_phantom: PhantomData<fn() -> K>
 }
 
 impl<K: SimKernels> FluidSim<K>
 {
-    pub fn new(h: f32, gravity: Vec2) -> Self {
+    pub fn new(h: f32, gravity: Vec2, heat_diffusion: f32, air_gen_params: Option<AirGenerationParams>) -> Self {
         FluidSim { 
-            grid: HashMap::new(), 
+            grid: SpatialHash::new(h),
             boundaries: Vec::new(), 
-            sinks: Vec::new(),
+            interacting_bodies : Vec::new(),
             fluid_types: Vec::new(),
-            particle_positions: HashMap::new(), 
             h, 
-            inv_grid_step: h.recip(),
-            particle_id_counter: AtomicU32::new(0),
+            particle_id_counter: 0,
             gravity,
-            heat_diffusion: 0.001,
-            k_phantom: PhantomData
+            heat_diffusion,
+            air_gen_params,
+            k_phantom: PhantomData,
+            sim_limits: None,
         }
+    }
+
+    pub fn with_sim_limits(mut self, sim_limits: AABB) -> Self {
+        self.sim_limits = Some(sim_limits);
+        self
+    }
+
+    pub fn h(&self) -> f32 {
+        self.h
+    }
+
+    pub fn grid(&self) -> &SpatialHash {
+        &self.grid
+    }
+
+    pub fn grid_mut(&mut self) -> &mut SpatialHash {
+        &mut self.grid
     }
 
     pub fn fluid_type(&self, id: FluidId) -> &FluidType {
@@ -189,67 +273,51 @@ impl<K: SimKernels> FluidSim<K>
         (self.fluid_types.len() - 1) as FluidId
     }
 
-    fn grid_index_no_borrow(pos: Vec2, inv_grid_step: f32) -> IVec2 {
-        (pos * inv_grid_step).floor().as_ivec2()
-    }
-
-    pub fn grid_index(&self, pos: Vec2) -> IVec2 {
-        (pos * self.inv_grid_step).floor().as_ivec2()
-    }
-
     pub fn boundaries(&self) -> impl Iterator<Item = &Box<dyn Shape>> {
         self.boundaries.iter()
     }
 
+    pub fn interacting_bodies(&self) -> impl Iterator<Item = &Box<dyn InteractingStaticBody>> {
+        self.interacting_bodies.iter()
+    }
+
     pub fn num_particles(&self) -> usize {
-        self.particle_positions.len()
+        self.grid.particle_cells.len()
     }
 
     pub fn add_boundaries(&mut self, boundaries: impl IntoIterator<Item = Box<dyn Shape>>) {
         for b in boundaries {
-            for i in self.get_boundary_cells(&b) {
-                let cell = self.grid.entry(i).or_default();
-                cell.boundaries.push(self.boundaries.len());
-            }
+            self.grid.register_boundary(self.boundaries.len(), &b);
             self.boundaries.push(b);
         }
     }
 
-    pub fn add_sinks(&mut self, sinks: impl IntoIterator<Item = Box<dyn Shape>>) {
-        for s in sinks {
-            for i in self.get_boundary_cells(&s) {
-                let cell = self.grid.entry(i).or_default();
-                cell.sinks.push(self.sinks.len());
-            }
-            self.sinks.push(s);
+    pub fn add_interacting_body(&mut self, body: impl InteractingStaticBody + 'static) -> usize {
+        self.grid.register_interacting_body(self.interacting_bodies.len(), &body);
+        self.interacting_bodies.push(Box::new(body));
+        self.interacting_bodies.len() - 1
+    }
+
+    pub fn add_interacting_bodies(&mut self, bodies: impl IntoIterator<Item = Box<dyn InteractingStaticBody>>) {
+        for b in bodies {
+            self.grid.register_interacting_body(self.interacting_bodies.len(), &b);
+            self.interacting_bodies.push(b);
         }
     }
 
     pub fn spawn_particle(&mut self, mut particle: FluidParticle) -> ParticleId {
-        particle.id = self.particle_id_counter.fetch_add(1, Ordering::Relaxed);
-
-        let i = self.grid_index(particle.x);
-        let cell = self.grid.entry(i).or_default();
-
-        self.particle_positions.insert(particle.id, i);
-        *cell.particles.insert_unique_unchecked(particle.id, particle).0
+        self.particle_id_counter += 1;
+        particle.id = self.particle_id_counter;
+        self.grid.add_particle(particle);
+        self.particle_id_counter
     }
     
     pub fn delete_particle(&mut self, particle_id: ParticleId) -> Option<FluidParticle> {
-        let i = self.particle_positions.remove(&particle_id)?;
-        let cell = self.grid.get_mut(&i)?;
-        let particle = cell.particles.remove(&particle_id);
-
-        // TODO: Cache grid cells for some time, instead of pre-emptively destroying them!
-        if cell.is_empty() {
-            self.grid.remove(&i);
-        }
-
-        particle
+        self.grid.remove_particle(particle_id)
     }
 
     pub fn clear_forces(&mut self) {
-        for cell in self.grid.values_mut() {
+        for cell in self.grid.cells.values_mut() {
             for p in cell.particles.values_mut() {
                 p.f = Vec2::ZERO;
             }
@@ -257,48 +325,50 @@ impl<K: SimKernels> FluidSim<K>
     }
 
     pub fn particles(&self) -> impl Iterator<Item = &FluidParticle> {
-        self.grid.values().flat_map(|c| c.particles.values())
+        self.grid.cells.values().flat_map(|c| c.particles.values())
     }
 
     pub fn particles_mut(&mut self) -> impl Iterator<Item = &mut FluidParticle> {
-        self.grid.values_mut().flat_map(|c| c.particles.values_mut())
+        self.grid.cells.values_mut().flat_map(|c| c.particles.values_mut())
     }
 
     pub fn range_query(&self, pos: Vec2, r: f32) -> impl Iterator<Item = &FluidParticle> {
-        let low = self.grid_index(pos - r);
-        let high = self.grid_index(pos + r);
-        let r2 = r * r;
-
-        (low.x ..= high.x)
-            .cartesian_product(low.y ..= high.y)
-            .filter_map(move |i| self.grid.get(&ivec2(i.0, i.1)))
-            .flat_map(|c| c.particles.values())
-            .filter(move |p| (p.x - pos).length_squared() < r2)
+        self.grid.range_query(pos, r)
     }
 
-    pub fn update_densities(&mut self, dt: f32) {
-        self.particle_positions.par_iter().for_each(|(id, i)| {
-            let pi = self.grid[i].particles[id];
+    pub fn update_densities(&mut self, _: f32) {
+        let grid = &self.grid;
+        grid.particles_par().for_each(|(pi, _)| {
             let mut rho: f32 = 0.;
-            for pj in self.range_query(pi.x, self.h) {
-                rho += pj.m * K::DensityKernel::value_unchecked(pj.x, (pi.x - pj.x).length(), self.h);
+            for pj in grid.range_query(pi.x, self.h) {
+                let r = pi.x - pj.x;
+                let l = if K::DensityKernel::VALUE_NEEDS_SQRT { r.length() } else { 0. };
+                rho += pj.m * K::DensityKernel::value_unchecked(r, l, self.h);
             }
             // SAFETY: This breaks Rust's invariants, but is safe? due to the way particles are updated
-            compiler_fence(Ordering::SeqCst);
+            compiler_fence(Ordering::Acquire);
             unsafe {
                 let ptr = pi as *const FluidParticle as *mut FluidParticle;
                 (*ptr).rho = rho;
             }
+            compiler_fence(Ordering::Release);
         });
     }
 
     pub fn apply_fluid_forces(&mut self, dt: f32) {
-        for pi in self.particles() {
+        let grid = &self.grid;
+        let fluid_types = &self.fluid_types;
+        grid.particles_par().for_each(|(pi, _)| {
             let mut pressure_force = Vec2::ZERO;
             let mut viscosity_force = Vec2::ZERO;
+
+            let ft = unsafe {
+                fluid_types.get(pi.fluid_id as usize).unwrap_unchecked()
+            };
             
-            let mut interface_normal = Vec2::ZERO;
-            let mut surface_normal = Vec2::ZERO;
+            let mut ci_grad = Vec2::ZERO;
+            let mut cs_grad = Vec2::ZERO;
+            let mut cp_grad = Vec2::ZERO;
 
             let mut interface_curvature = 0.;// pi.m * pi.ci / pi.rho * K::InterfaceKernel::laplacian_unchecked(Vec2::ZERO, 0., self.h);
             let mut surface_curvature = 0.; //pi.m * pi.cs / pi.rho * K::InterfaceKernel::laplacian_unchecked(Vec2::ZERO, 0., self.h);
@@ -306,7 +376,7 @@ impl<K: SimKernels> FluidSim<K>
             let mut heat_diff : f32 = 0.;
             let pi_p = pi.k * (pi.rho - pi.rho0);
 
-            for pj in self.range_query(pi.x, self.h) {
+            for pj in grid.range_query(pi.x, self.h) {
                 if pi.id == pj.id { continue; }
 
                 let pj_p = pj.k * (pj.rho - pj.rho0);
@@ -317,8 +387,9 @@ impl<K: SimKernels> FluidSim<K>
                 viscosity_force += (pi.mu + pj.mu) / 2. * pj.m * (pj.v - pi.v) / pj.rho * K::ViscosityKernel::laplacian_unchecked(r, l, self.h);
 
                 let interface_gradient = K::InterfaceKernel::gradient_unchecked(r, l, self.h);
-                interface_normal += pj.m * pj.ci / pj.rho * interface_gradient;
-                surface_normal += pj.m * pj.cs / pj.rho * interface_gradient;
+                ci_grad += pj.m * pj.ci / pj.rho * interface_gradient;
+                cs_grad += pj.m * pj.cs / pj.rho * interface_gradient;
+                cp_grad += pj.m / pj.rho * interface_gradient;
 
                 let interface_laplacian = K::InterfaceKernel::laplacian_unchecked(r, l, self.h);
                 interface_curvature += pj.m * pj.ci / pj.rho * interface_laplacian;
@@ -327,38 +398,45 @@ impl<K: SimKernels> FluidSim<K>
                 heat_diff += pj.m * (pj.t - pi.t) / pj.rho * K::HeatKernel::laplacian_unchecked(r, l, self.h);
             }
 
-            interface_normal = if interface_normal.length_squared() >= 0.001 {
-                interface_normal.normalize()
+            let interface_normal = if ci_grad.length_squared() >= 0.1 {
+                ci_grad.normalize()
             } else {
                 Vec2::ZERO
             };
-            surface_normal = if surface_normal.length_squared() >= 0.001 {
-                surface_normal.normalize()
+            let surface_normal = if cs_grad.length_squared() >= 0.1 {
+                cs_grad.normalize()
             } else {
                 Vec2::ZERO
             };
 
-            let interface_force = pi.sigma_i * interface_curvature * interface_normal;
-            let surface_force = pi.sigma_s * surface_curvature * surface_normal;
+            let interface_force = -ft.sigma_i * interface_curvature * interface_normal;
+            let surface_force = -ft.sigma_s * surface_curvature * surface_normal;
 
-            // SAFETY: This breaks Rust's invariants, but is safe due to the way particles are updated
-            compiler_fence(Ordering::SeqCst);
+            // SAFETY: This breaks Rust's invariants, but is safe? due to the way particles are updated
+            compiler_fence(Ordering::Acquire);
             unsafe {
                 let ptr = pi as *const FluidParticle as *mut FluidParticle;
                 (*ptr).f += pressure_force + viscosity_force + interface_force + surface_force;
+                (*ptr).ci_grad = ci_grad;
+                (*ptr).cs_grad = cs_grad;
+                (*ptr).cp_grad = cp_grad;
                 (*ptr).next_t = pi.t + dt * self.heat_diffusion * heat_diff;
             }
-        }
+            compiler_fence(Ordering::Release);
+        });
     }
 
-    pub fn integrate_and_collide(&mut self, dt: f32) {
-        let mut deletion_queue : Vec<ParticleId> = Vec::new();
+    pub fn tick(&mut self, dt: f32) {
+        self.clear_forces();
+        self.update_densities(dt);
+        self.apply_fluid_forces(dt);
 
-        for (&id, i) in self.particle_positions.iter_mut() {
-            let grid = &mut self.grid;
-            let cell = grid.get_mut(i).unwrap();
-            let p = cell.particles.get_mut(&id).unwrap();
+        let limits = self.sim_limits.clone();
+        let opt_air_gen = self.air_gen_params.to_owned();
+        let mut air_to_spawn : Vec<(Vec2, Vec2)> = Vec::new();
 
+        self.grid.move_and_filter_particles(|p, boundaries, bodies| {
+            // Simple sympletic Euler integration scheme
             let a = p.f / p.rho + self.gravity;
             p.v += a * dt;
             p.x += p.v * dt;
@@ -366,54 +444,96 @@ impl<K: SimKernels> FluidSim<K>
             p.t = p.next_t;
             p.rho0 = p.alpha / p.t;
 
+            // Delete particles that escape simulation limits, if any are set
+            if let Some(l) = &limits  {
+                if !l.aa.cmple(p.x).all() || !l.bb.cmpge(p.x).all() {
+                    return true;
+                }
+            }
+
             // Model the particle as a perfect sphere for boundary collisions
             let particle_radius =  (p.m / p.rho).sqrt() / 2.;
 
-            // Temporary (read: permanent) fix to make borrow checker happy
-            for &bi in &cell.boundaries {
+            // Interact with static bodies in the simulation
+            if bodies.iter().any(|&bi| self.interacting_bodies[bi].interact(p, particle_radius, dt)) {
+                return true;
+            }
+
+            // Solve collisions
+            let mut collided = false;
+            for &bi in boundaries.iter() {
                 if let Some(c) = self.boundaries[bi].check_circle_collisions(p.x, particle_radius) {
                     // Push particle out of boundary, and perform elastic collision
+                    collided = true;
                     p.x += c.normal * c.penetration;
                     p.v -= 2. * c.normal * p.v.dot(c.normal);
                 }
             }
 
-            // Check if particle should be deleted due to touching a sink
-            for &si in &cell.sinks {
-                if self.sinks[si].check_circle_collisions(p.x, particle_radius).is_some() {
-                    deletion_queue.push(id);
+            // Handle air particle generation & destruction
+            if let Some(air_gen) = &opt_air_gen {
+                let cp_len = p.cp_grad.length_squared();
+
+                // If this is an air particle...
+                if p.fluid_id == air_gen.air_id {
+                    // If this is an air particle that is far away from a surface
+                    // and from other air particles, or very low-density, delete it.
+                    if (cp_len > air_gen.deletion_threshold_p && p.cs_grad.length_squared() < air_gen.deletion_threshold_s) ||
+                        p.rho < air_gen.deletion_threshold_rho {
+                        return true;
+                    }
+
+                    // Apply artificial buoyancy
+                    p.f -= air_gen.air_buyoyancy * (p.rho - p.rho0) * self.gravity;
+                } 
+
+                // If didn't collide yet, run collision detection again to make sure > h from a boundary
+                collided = collided || boundaries.iter().any(|&b| {
+                    self.boundaries[b].check_circle_collisions(p.x, self.h).is_some()
+                });
+
+                // If this particle is at a liquid-air boundary and facing downward, spawn an air particle. 
+                if !collided && cp_len > air_gen.generation_threshold && p.cp_grad.dot(self.gravity) < 0. {
+                    air_to_spawn.push((p.x - air_gen.spawn_position_offset * p.cp_grad, p.v));
                 }
             }
+            false
+        });
 
-            let i_new = Self::grid_index_no_borrow(p.x, self.inv_grid_step);
-            let id = p.id;
-
-            if i_new != *i {
-                let p = cell.particles.remove(&id).unwrap();
-                if cell.is_empty() {
-                   grid.remove(i);
-                }
-                let new_cell = grid.entry(i_new).or_default();
-                // SAFETY: Particle IDs guaranteed unique
-                new_cell.particles.insert_unique_unchecked(id, p);
-                *i = i_new;
+        if let Some(air_gen) = &opt_air_gen {
+            let air_fluid = self.fluid_type(air_gen.air_id).clone();
+            for &(x, v) in air_to_spawn.iter() {
+                let rho = air_fluid.alpha / air_gen.air_temp;
+                self.spawn_particle(FluidParticle { 
+                    m: air_gen.air_mass, 
+                    x: x, 
+                    v: v, 
+                    f: Vec2::ZERO, 
+                    ci_grad: Vec2::ZERO,
+                    cp_grad: Vec2::ZERO, 
+                    cs_grad: Vec2::ZERO, 
+                    alpha: air_fluid.alpha, 
+                    rho0: rho, 
+                    rho: rho, 
+                    mu: air_fluid.mu, 
+                    k: air_fluid.k, 
+                    ci: air_fluid.ci, 
+                    cs: air_fluid.cs, 
+                    // sigma_i: air_fluid.sigma_i,
+                    // sigma_s: air_fluid.sigma_s, 
+                    t: air_gen.air_temp, 
+                    next_t: air_gen.air_temp, 
+                    id: 0, 
+                    fluid_id: air_gen.air_id 
+                });
             }
         }
 
-        for id in deletion_queue {
-            self.delete_particle(id);
-        }
-    }
-
-    pub fn tick(&mut self, dt: f32) {
-        self.clear_forces();
-        self.update_densities(dt);
-        self.apply_fluid_forces(dt);
-        self.integrate_and_collide(dt);
+        self.grid.remove_empty_cells();
     }
 
     pub fn draw_grid_cells(&self, thickness: f32, outline: Option<Color>, fill: Option<Color>) {
-        for i in self.grid.keys() {
+        for i in self.grid.cells.keys() {
             let pos = i.as_vec2() * self.h;
             if let Some(c) = fill {
                 draw_rectangle(pos.x, pos.y, self.h, self.h, c);
