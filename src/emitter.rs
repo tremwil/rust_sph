@@ -35,8 +35,6 @@ impl FluidEmitter {
                 k: consts.k, 
                 ci: consts.ci, 
                 cs: consts.cs, 
-                // sigma_i: consts.sigma_i,
-                // sigma_s: consts.sigma_s,
                 t: self.spawn_temp,
                 next_t: self.spawn_temp,
                 id: 0,

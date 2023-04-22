@@ -409,8 +409,8 @@ impl<K: SimKernels> FluidSim<K>
                 Vec2::ZERO
             };
 
-            let interface_force = -ft.sigma_i * interface_curvature * interface_normal;
-            let surface_force = -ft.sigma_s * surface_curvature * surface_normal;
+            let interface_force = ft.sigma_i * interface_curvature * interface_normal;
+            let surface_force = ft.sigma_s * surface_curvature * surface_normal;
 
             // SAFETY: This breaks Rust's invariants, but is safe? due to the way particles are updated
             compiler_fence(Ordering::Acquire);
@@ -485,6 +485,7 @@ impl<K: SimKernels> FluidSim<K>
 
                     // Apply artificial buoyancy
                     p.f -= air_gen.air_buyoyancy * (p.rho - p.rho0) * self.gravity;
+                    return false;
                 } 
 
                 // If didn't collide yet, run collision detection again to make sure > h from a boundary
@@ -519,8 +520,6 @@ impl<K: SimKernels> FluidSim<K>
                     k: air_fluid.k, 
                     ci: air_fluid.ci, 
                     cs: air_fluid.cs, 
-                    // sigma_i: air_fluid.sigma_i,
-                    // sigma_s: air_fluid.sigma_s, 
                     t: air_gen.air_temp, 
                     next_t: air_gen.air_temp, 
                     id: 0, 

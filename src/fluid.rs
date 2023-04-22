@@ -137,8 +137,6 @@ impl FluidParticle
                     k: consts.k, 
                     ci: consts.ci, 
                     cs: consts.cs, 
-                    // sigma_i: consts.sigma_i,
-                    // sigma_s: consts.sigma_s,
                     t: params.t, 
                     next_t: params.t,
                     id: 0,

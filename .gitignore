@@ -9,3 +9,6 @@ Cargo.lock
 *.blg
 *.aux
 *.fdb_latexmk
+paper/_minted-projectReport/A71822A41FBDA2DCF6AC97B54BEA5A2ACC251BDADC52B24FF502C8C938DB5103.pygtex
+paper/_minted-projectReport/default-pyg-prefix.pygstyle
+paper/_minted-projectReport/default.pygstyle
